@@ -34,10 +34,12 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
+use rand::distributions::{Alphanumeric, DistString};
 use time::{format_description, Date, Duration, OffsetDateTime, Time};
 
 mod builder;
 pub use builder::{Builder, InitError};
+use symlink::{symlink_file, remove_symlink_file};
 
 /// A file appender with the ability to rotate log files at a fixed schedule.
 ///
@@ -699,6 +701,18 @@ fn create_writer(directory: &Path, filename: &str) -> Result<File, InitError> {
                 .open(path)
                 .map_err(InitError::ctx("failed to create initial log file"));
         }
+    }
+
+    // Create a symlink to latest log file - create a temporary symlink
+    // and use rename to atomically replace the existing one if it exists.
+    let rand = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+    let temp_symlink_path = directory.join(&format!(".current.log.{}", rand));
+    let symlink_path = directory.join(&"current.log");
+    if let Err(err) = symlink_file(&path.file_name().unwrap(), &temp_symlink_path) {
+        eprintln!("Couldn't create symlink: {}", err);
+    } else {
+        std::fs::rename(temp_symlink_path, symlink_path)
+            .map_err(InitError::ctx("error placing symlink file"))?;
     }
 
     new_file.map_err(InitError::ctx("failed to create initial log file"))
