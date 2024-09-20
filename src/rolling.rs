@@ -28,18 +28,14 @@
 //! ```
 use crate::sync::{RwLock, RwLockReadGuard};
 use std::{
-    fmt::{self, Debug},
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    fmt::{self, Debug}, fs::{self, File, OpenOptions}, io::{self, Seek, Write}, ops::{Deref, DerefMut}, path::{Path, PathBuf}, sync::atomic::{AtomicUsize, Ordering}
 };
 use rand::distributions::{Alphanumeric, DistString};
 use time::{format_description, Date, Duration, OffsetDateTime, Time};
 
 mod builder;
 pub use builder::{Builder, InitError};
-use symlink::{symlink_file, remove_symlink_file};
+use symlink::symlink_file;
 
 /// A file appender with the ability to rotate log files at a fixed schedule.
 ///
@@ -87,9 +83,15 @@ use symlink::{symlink_file, remove_symlink_file};
 /// [`MakeWriter`]: tracing_subscriber::fmt::writer::MakeWriter
 pub struct RollingFileAppender {
     state: Inner,
-    writer: RwLock<File>,
+    writer: RwLock<AppenderState>,
     #[cfg(test)]
     now: Box<dyn Fn() -> OffsetDateTime + Send + Sync>,
+}
+
+#[derive(Debug)]
+struct AppenderState {
+    file: File,
+    position: u64,
 }
 
 /// A [writer] that writes to a rolling log file.
@@ -99,14 +101,15 @@ pub struct RollingFileAppender {
 /// [writer]: std::io::Write
 /// [`MakeWriter`]: tracing_subscriber::fmt::writer::MakeWriter
 #[derive(Debug)]
-pub struct RollingWriter<'a>(RwLockReadGuard<'a, File>);
+pub struct RollingWriter<'a>(RwLockReadGuard<'a, AppenderState>);
 
 #[derive(Debug)]
 struct Inner {
     log_directory: PathBuf,
     log_filename_prefix: Option<String>,
     log_filename_suffix: Option<String>,
-    date_format: Vec<format_description::FormatItem<'static>>,
+    date_format: (Vec<format_description::FormatItem<'static>>,
+        Option<Vec<format_description::FormatItem<'static>>>),
     rotation: Rotation,
     next_date: AtomicUsize,
     max_files: Option<usize>,
@@ -225,11 +228,12 @@ impl io::Write for RollingFileAppender {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let now = self.now();
         let writer = self.writer.get_mut();
-        if let Some(current_time) = self.state.should_rollover(now) {
+        if let Some(current_time) = self.state.should_rollover(now, writer.position as u64) {
             let _did_cas = self.state.advance_date(now, current_time);
             debug_assert!(_did_cas, "if we have &mut access to the appender, no other thread can have advanced the timestamp...");
             self.state.refresh_writer(now, writer);
         }
+        writer.position += buf.len() as u64;
         writer.write(buf)
     }
 
@@ -244,7 +248,7 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for RollingFileAppender
         let now = self.now();
 
         // Should we try to roll over the log file?
-        if let Some(current_time) = self.state.should_rollover(now) {
+        if let Some(current_time) = self.state.should_rollover(now, 0) {
             // Did we get the right to lock the file? If not, another thread
             // did it and we can just make a writer.
             if self.state.advance_date(now, current_time) {
@@ -446,6 +450,7 @@ enum RotationKind {
     Minutely,
     Hourly,
     Daily,
+    DailyLimitSize(u64),
     Never,
 }
 
@@ -459,11 +464,17 @@ impl Rotation {
     /// Provides a rotation that never rotates.
     pub const NEVER: Self = Self(RotationKind::Never);
 
+    // Limited daily rotation
+    pub fn daily_limited(limit: u64) -> Self {
+        Self(RotationKind::DailyLimitSize(limit))
+    }
+
     pub(crate) fn next_date(&self, current_date: &OffsetDateTime) -> Option<OffsetDateTime> {
         let unrounded_next_date = match *self {
             Rotation::MINUTELY => *current_date + Duration::minutes(1),
             Rotation::HOURLY => *current_date + Duration::hours(1),
             Rotation::DAILY => *current_date + Duration::days(1),
+            Rotation(RotationKind::DailyLimitSize(_)) => *current_date + Duration::days(1),
             Rotation::NEVER => return None,
         };
         Some(self.round_date(&unrounded_next_date))
@@ -482,6 +493,7 @@ impl Rotation {
                     .expect("Invalid time; this is a bug in tracing-appender");
                 date.replace_time(time)
             }
+            Rotation(RotationKind::DailyLimitSize(_)) |
             Rotation::DAILY => {
                 let time = Time::from_hms(0, 0, 0)
                     .expect("Invalid time; this is a bug in tracing-appender");
@@ -494,14 +506,40 @@ impl Rotation {
         }
     }
 
-    fn date_format(&self) -> Vec<format_description::FormatItem<'static>> {
-        match *self {
+    fn date_format(&self) -> (Vec<format_description::FormatItem<'static>>,
+        Option<Vec<format_description::FormatItem<'static>>>)
+    {
+        let x = match *self {
             Rotation::MINUTELY => format_description::parse("[year]-[month]-[day]-[hour]-[minute]"),
             Rotation::HOURLY => format_description::parse("[year]-[month]-[day]-[hour]"),
+            Rotation(RotationKind::DailyLimitSize(_)) =>
+                format_description::parse("[year]-[month]-[day].*"),
             Rotation::DAILY => format_description::parse("[year]-[month]-[day]"),
             Rotation::NEVER => format_description::parse("[year]-[month]-[day]"),
-        }
-        .expect("Unable to create a formatter; this is a bug in tracing-appender")
+        }.expect("Unable to create a formatter; this is a bug in tracing-appender");
+
+        let y = match *self {
+            Rotation(RotationKind::DailyLimitSize(_)) =>
+                Some(format_description::parse("[year]-[month]-[day].[hour]-[minute]-[second].[subsecond digits:6]")
+                    .expect("Unable to create a formatter; this is a bug in tracing-appender")),
+            _ => None,
+        };
+
+        (x, y)
+    }
+}
+
+impl Deref for AppenderState {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl DerefMut for AppenderState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.file
     }
 }
 
@@ -509,11 +547,11 @@ impl Rotation {
 
 impl io::Write for RollingWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&*self.0).write(buf)
+        (&**self.0).write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        (&*self.0).flush()
+        (&**self.0).flush()
     }
 }
 
@@ -527,11 +565,15 @@ impl Inner {
         log_filename_prefix: Option<String>,
         log_filename_suffix: Option<String>,
         max_files: Option<usize>,
-    ) -> Result<(Self, RwLock<File>), builder::InitError> {
+    ) -> Result<(Self, RwLock<AppenderState>), builder::InitError> {
         let log_directory = directory.as_ref().to_path_buf();
         let date_format = rotation.date_format();
         let next_date = rotation.next_date(&now);
 
+        let max_size = match &rotation.0 {
+            RotationKind::DailyLimitSize(size) => Some(*size),
+            _ => None
+        };
         let inner = Inner {
             log_directory,
             log_filename_prefix,
@@ -545,17 +587,18 @@ impl Inner {
             rotation,
             max_files,
         };
-        let filename = inner.join_date(&now);
-        let writer = RwLock::new(create_writer(inner.log_directory.as_ref(), &filename)?);
+        let filenames = inner.join_date(&now);
+
+        let writer = RwLock::new(create_writer(inner.log_directory.as_ref(), &filenames, max_size)?);
         Ok((inner, writer))
     }
 
-    pub(crate) fn join_date(&self, date: &OffsetDateTime) -> String {
-        let date = date
-            .format(&self.date_format)
+    pub(crate) fn join_date(&self, date: &OffsetDateTime) -> (String, Option<String>) {
+        let date_str = date
+            .format(&self.date_format.0)
             .expect("Unable to format OffsetDateTime; this is a bug in tracing-appender");
 
-        match (
+        let x = match (
             &self.rotation,
             &self.log_filename_prefix,
             &self.log_filename_suffix,
@@ -563,11 +606,21 @@ impl Inner {
             (&Rotation::NEVER, Some(filename), None) => filename.to_string(),
             (&Rotation::NEVER, Some(filename), Some(suffix)) => format!("{}.{}", filename, suffix),
             (&Rotation::NEVER, None, Some(suffix)) => suffix.to_string(),
-            (_, Some(filename), Some(suffix)) => format!("{}.{}.{}", filename, date, suffix),
-            (_, Some(filename), None) => format!("{}.{}", filename, date),
-            (_, None, Some(suffix)) => format!("{}.{}", date, suffix),
-            (_, None, None) => date,
-        }
+            (_, Some(filename), Some(suffix)) => format!("{}.{}.{}", filename, date_str, suffix),
+            (_, Some(filename), None) => format!("{}.{}", filename, date_str),
+            (_, None, Some(suffix)) => format!("{}.{}", date_str, suffix),
+            (_, None, None) => date_str,
+        };
+
+        let y = match (&self.date_format.1, &self.log_filename_prefix, &self.log_filename_suffix) {
+            (Some(df), Some(filename), Some(suffix)) => Some(format!("{}.{}.{}", filename, date
+                .format(df)
+                .expect("Unable to format OffsetDateTime; this is a bug in tracing-appender")
+                , suffix)),
+            _ => None,
+        };
+
+        (x, y)
     }
 
     fn prune_old_logs(&self, max_files: usize) {
@@ -599,7 +652,7 @@ impl Inner {
 
                 if self.log_filename_prefix.is_none()
                     && self.log_filename_suffix.is_none()
-                    && Date::parse(filename, &self.date_format).is_err()
+                    && Date::parse(filename, &self.date_format.0).is_err()
                 {
                     return None;
                 }
@@ -636,19 +689,24 @@ impl Inner {
         }
     }
 
-    fn refresh_writer(&self, now: OffsetDateTime, file: &mut File) {
-        let filename = self.join_date(&now);
+    fn refresh_writer(&self, now: OffsetDateTime, state: &mut AppenderState) {
+        let filenames = self.join_date(&now);
 
         if let Some(max_files) = self.max_files {
             self.prune_old_logs(max_files);
         }
 
-        match create_writer(&self.log_directory, &filename) {
-            Ok(new_file) => {
-                if let Err(err) = file.flush() {
+        let max_size = match &self.rotation.0 {
+            RotationKind::DailyLimitSize(size) => Some(*size),
+            _ => None
+        };
+
+        match create_writer(&self.log_directory, &filenames, max_size) {
+            Ok(new_state) => {
+                if let Err(err) = state.file.flush() {
                     eprintln!("Couldn't flush previous writer: {}", err);
                 }
-                *file = new_file;
+                *state = new_state;
             }
             Err(err) => eprintln!("Couldn't create writer for logs: {}", err),
         }
@@ -662,7 +720,16 @@ impl Inner {
     ///
     /// If this method returns `Some`, we should roll to a new log file.
     /// Otherwise, if this returns we should not rotate the log file.
-    fn should_rollover(&self, date: OffsetDateTime) -> Option<usize> {
+    fn should_rollover(&self, date: OffsetDateTime, position: u64) -> Option<usize> {
+        match &self.rotation.0 {
+            RotationKind::DailyLimitSize(size) => {
+                if *size < position {
+                    return Some(date.unix_timestamp() as usize);
+                }
+            }
+            _ => {}
+        }
+
         let next_date = self.next_date.load(Ordering::Acquire);
         // if the next date is 0, this appender *never* rotates log files.
         if next_date == 0 {
@@ -688,8 +755,47 @@ impl Inner {
     }
 }
 
-fn create_writer(directory: &Path, filename: &str) -> Result<File, InitError> {
-    let path = directory.join(filename);
+fn create_writer(directory: &Path, filenames: &(String, Option<String>), max_size: Option<u64>) -> Result<AppenderState, InitError> {
+    let path = match &filenames.1 {
+        Some(new_file) => {
+            let globpat = &filenames.0;
+            let mut other_files = vec![];
+            let pat = directory.join(globpat);
+            let pat = pat.to_string_lossy();
+            let pat = pat.as_ref();
+            if let Ok(r) = glob::glob(pat) {
+                for entry in r {
+                    match entry {
+                        Ok(path) => if let Some(filename) = path.file_name() {
+                            other_files.push(filename.to_string_lossy().as_ref().to_owned());
+                        }
+                        Err(_) => {},
+                    }
+                }
+                other_files.sort();
+                if let Some(last) = other_files.last() {
+                    if let Some(max_size) = max_size {
+                        let candidate = directory.join(last).metadata()
+                            .map_err(InitError::ctx("failed to get last file meta-data"))?;
+                        if candidate.len() < max_size {
+                            directory.join(last)
+                        } else {
+                            directory.join(&new_file)
+                        }
+                    } else {
+                        directory.join(&new_file)
+                    }
+                } else {
+                    directory.join(&new_file)
+                }
+            } else {
+                directory.join(&new_file)
+            }
+        },
+        None => {
+            directory.join(&filenames.0)
+        },
+    };
     let mut open_options = OpenOptions::new();
     open_options.append(true).create(true);
 
@@ -697,9 +803,13 @@ fn create_writer(directory: &Path, filename: &str) -> Result<File, InitError> {
     if new_file.is_err() {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(InitError::ctx("failed to create log directory"))?;
-            return open_options
+            let file = open_options
                 .open(path)
-                .map_err(InitError::ctx("failed to create initial log file"));
+                .map_err(InitError::ctx("failed to create initial log file"))?;
+            return Ok(AppenderState {
+                file,
+                position: 0,
+            })
         }
     }
 
@@ -715,7 +825,12 @@ fn create_writer(directory: &Path, filename: &str) -> Result<File, InitError> {
             .map_err(InitError::ctx("error placing symlink file"))?;
     }
 
-    new_file.map_err(InitError::ctx("failed to create initial log file"))
+    let file = new_file.map_err(InitError::ctx("failed to create initial log file"))?;
+    let pos = path.metadata().map_err(InitError::ctx("failed to get last file meta-data"))?.len();
+    return Ok(AppenderState {
+        position: pos,
+        file,
+    })
 }
 
 #[cfg(test)]
