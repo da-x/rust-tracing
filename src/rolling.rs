@@ -28,13 +28,13 @@
 //! ```
 use crate::sync::{RwLock, RwLockReadGuard};
 use std::{
-    fmt::{self, Debug}, fs::{self, File, OpenOptions}, io::{self, Seek, Write}, ops::{Deref, DerefMut}, path::{Path, PathBuf}, sync::atomic::{AtomicUsize, Ordering}
+    fmt::{self, Debug}, fs::{self, File, OpenOptions}, io::{self, BufReader, BufWriter, Write}, ops::{Deref, DerefMut}, path::{Path, PathBuf}, sync::atomic::{AtomicUsize, Ordering}
 };
 use rand::distributions::{Alphanumeric, DistString};
 use time::{format_description, Date, Duration, OffsetDateTime, Time};
 
 mod builder;
-pub use builder::{Builder, InitError};
+pub use builder::{Builder, InitError, CompressionKind};
 use symlink::symlink_file;
 
 /// A file appender with the ability to rotate log files at a fixed schedule.
@@ -91,6 +91,7 @@ pub struct RollingFileAppender {
 #[derive(Debug)]
 struct AppenderState {
     file: File,
+    pathname: PathBuf,
     position: u64,
 }
 
@@ -113,6 +114,7 @@ struct Inner {
     rotation: Rotation,
     next_date: AtomicUsize,
     max_files: Option<usize>,
+    rotation_compress_kind: CompressionKind,
 }
 
 // === impl RollingFileAppender ===
@@ -195,6 +197,7 @@ impl RollingFileAppender {
             ref prefix,
             ref suffix,
             ref max_files,
+            ref rotation_compress_kind,
         } = builder;
         let directory = directory.as_ref().to_path_buf();
         let now = OffsetDateTime::now_utc();
@@ -205,6 +208,7 @@ impl RollingFileAppender {
             prefix.clone(),
             suffix.clone(),
             *max_files,
+            *rotation_compress_kind,
         )?;
         Ok(Self {
             state,
@@ -464,7 +468,7 @@ impl Rotation {
     /// Provides a rotation that never rotates.
     pub const NEVER: Self = Self(RotationKind::Never);
 
-    // Limited daily rotation
+    /// Limited daily rotation
     pub fn daily_limited(limit: u64) -> Self {
         Self(RotationKind::DailyLimitSize(limit))
     }
@@ -565,6 +569,7 @@ impl Inner {
         log_filename_prefix: Option<String>,
         log_filename_suffix: Option<String>,
         max_files: Option<usize>,
+        rotation_compress_kind: CompressionKind,
     ) -> Result<(Self, RwLock<AppenderState>), builder::InitError> {
         let log_directory = directory.as_ref().to_path_buf();
         let date_format = rotation.date_format();
@@ -579,6 +584,7 @@ impl Inner {
             log_filename_prefix,
             log_filename_suffix,
             date_format,
+            rotation_compress_kind,
             next_date: AtomicUsize::new(
                 next_date
                     .map(|date| date.unix_timestamp() as usize)
@@ -706,6 +712,7 @@ impl Inner {
                 if let Err(err) = state.file.flush() {
                     eprintln!("Couldn't flush previous writer: {}", err);
                 }
+                let _ = compress_if_needed(self.rotation_compress_kind, &state.pathname);
                 *state = new_state;
             }
             Err(err) => eprintln!("Couldn't create writer for logs: {}", err),
@@ -752,6 +759,47 @@ impl Inner {
         self.next_date
             .compare_exchange(current, next_date, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+}
+
+fn compress_if_needed(rotation_compress_kind: CompressionKind, pathname: &PathBuf) -> Result<(), InitError> {
+    match rotation_compress_kind {
+        CompressionKind::None => {
+            return Ok(());
+        }
+        CompressionKind::Zstd => {
+            // Open the original file
+            let input_file = File::open(&pathname)
+                .map_err(InitError::ctx("opening input file to compress"))?;
+            let mut reader = BufReader::new(input_file);
+
+            // Create the compressed file path
+            let tmp_compressed_path = if let Some(file_name) = pathname.file_name() {
+                pathname.with_file_name(format!(".tmp.{}", file_name.to_string_lossy().as_ref().to_owned()))
+            } else {
+                PathBuf::from(format!("{}.zstd.tmp", pathname.display()))
+            };
+            let compressed_path = format!("{}.zstd", pathname.display());
+            let compressed_file = File::create(&tmp_compressed_path)
+                .map_err(InitError::ctx("opening output file to compress"))?;
+            let writer = BufWriter::new(compressed_file);
+
+            // Compress the file using zstd
+            let mut encoder = zstd::Encoder::new(writer, 3)
+                .map_err(InitError::ctx("zstd encoding creation"))?;
+            io::copy(&mut reader, &mut encoder)
+                .map_err(InitError::ctx("compressing"))?;
+            encoder.finish()
+                .map_err(InitError::ctx("zstd encoding finish"))?;
+
+            // Rename compressed file and remove
+            fs::rename(tmp_compressed_path, compressed_path)
+                .map_err(InitError::ctx("rename to compressed file"))?;
+            fs::remove_file(pathname)
+                .map_err(InitError::ctx("removing file to compress"))?;
+
+            Ok(())
+        }
     }
 }
 
@@ -804,10 +852,11 @@ fn create_writer(directory: &Path, filenames: &(String, Option<String>), max_siz
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(InitError::ctx("failed to create log directory"))?;
             let file = open_options
-                .open(path)
+                .open(path.clone())
                 .map_err(InitError::ctx("failed to create initial log file"))?;
             return Ok(AppenderState {
                 file,
+                pathname: path.as_path().to_owned(),
                 position: 0,
             })
         }
@@ -829,6 +878,7 @@ fn create_writer(directory: &Path, filenames: &(String, Option<String>), max_siz
     let pos = path.metadata().map_err(InitError::ctx("failed to get last file meta-data"))?.len();
     return Ok(AppenderState {
         position: pos,
+        pathname: path.as_path().to_owned(),
         file,
     })
 }

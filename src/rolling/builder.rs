@@ -11,6 +11,7 @@ pub struct Builder {
     pub(super) prefix: Option<String>,
     pub(super) suffix: Option<String>,
     pub(super) max_files: Option<usize>,
+    pub(super) rotation_compress_kind: CompressionKind,
 }
 
 /// Errors returned by [`Builder::build`].
@@ -26,6 +27,16 @@ impl InitError {
     pub(crate) fn ctx(context: &'static str) -> impl FnOnce(io::Error) -> Self {
         move |source| Self { context, source }
     }
+}
+
+/// How to compress after rotation
+#[derive(Debug, Clone, Copy)]
+pub enum CompressionKind {
+    /// Do not compress
+    None,
+
+    /// Compress with zstd
+    Zstd,
 }
 
 impl Builder {
@@ -54,6 +65,7 @@ impl Builder {
             prefix: None,
             suffix: None,
             max_files: None,
+            rotation_compress_kind: CompressionKind::None,
         }
     }
 
@@ -133,6 +145,12 @@ impl Builder {
             Some(prefix)
         };
         Self { prefix, ..self }
+    }
+
+    /// [rotation strategy]: Rotation
+    #[must_use]
+    pub fn rotation_compression(self, kind: CompressionKind) -> Self {
+        Self { rotation_compress_kind: kind, ..self }
     }
 
     /// Sets the suffix for log filenames. The suffix is output after the
